@@ -149,12 +149,16 @@ def main():
 	device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 	if torch.cuda.is_available() == False:
 		torch.set_num_threads(24)
+
 	params = {'batch_size':64, 'dropout':0, 'learning_rate':0.00001, 'epoch':15, 'optimizer':'Adam', 'model':'Transformer'}
 
 	Smiles_vocab = Vocab()
 	# read data
 	dataset = FinetuningDataset('input/dataset.csv', Smiles_vocab, seq_len=256)
 
+	# split the data into 3 parts (train/test/valid), where
+	# 'split_ratio'% is train, and the remaining is equally
+	# divided into test/valid
 	indices = list(range(len(dataset)))
 	np.random.shuffle(indices)
 	split1, split2 = int(np.floor(input_file['split_ratio'] * len(dataset))), int(np.floor(0.5 * (1 + input_file['split_ratio']) * len(dataset)))
@@ -162,14 +166,14 @@ def main():
 
 	train_sampler = SubsetRandomSampler(train_idx)
 	valid_sampler = SubsetRandomSampler(valid_idx)
-	test_sampler = SubsetRandomSampler(test_idx)
+	test_sampler  = SubsetRandomSampler(test_idx )
 
 	# dataloader(train, valid, test)
 	train_dataloader = DataLoader(dataset, batch_size=params['batch_size'], sampler=train_sampler, num_workers=4, pin_memory=True)
 	valid_dataloader = DataLoader(dataset, batch_size=params['batch_size'], sampler=valid_sampler, num_workers=4)
-	test_dataloader = DataLoader(dataset, batch_size=params['batch_size'], sampler=test_sampler, num_workers=4)
+	test_dataloader  = DataLoader(dataset, batch_size=params['batch_size'], sampler=test_sampler , num_workers=4)
 
-	#Load model
+	# Load model
 	model = Smiles_BERT(len(Smiles_vocab), max_len=256, nhead=16, feature_dim=1024, feedforward_dim=1024, nlayers=8, adj=True, dropout_rate=params['dropout'])
 	model.load_state_dict(torch.load('../model/pretrained_model.pt', map_location=device))
 	output_layer = nn.Linear(1024, 1)
@@ -187,16 +191,16 @@ def main():
 
 	test_crit = nn.MSELoss(reduction='none')
 
-	train_loss_list = []
-	valid_loss_list = []
+	train_loss_list  = []
+	valid_loss_list  = []
 	valid_score_list = []
-	test_score_list = []
+	test_score_list  = []
 	test_result_list = []
 
 	min_valid_loss = 10000
 	start_time = time.time()
 
-	#Start training
+	# Start training
 	for epoch in range(params['epoch']):
 		avg_loss = 0
 		valid_avg_loss = 0
@@ -207,8 +211,9 @@ def main():
 		predicted_list = np.array([])
 		target_list = np.array([])
 
-		model.train()
+		model.train() # Equivalent to model.train(True)
 		for i, data in enumerate(train_dataloader):
+			# train set
 			data = {key:value.to(device) for key, value in data.items()}
 			position_num = torch.arange(256).repeat(data["smiles_bert_input"].size(0),1).to(device)
 			output = model.forward(data["smiles_bert_input"], position_num, adj_mask=data["smiles_bert_adj_mask"], adj_mat=data["smiles_bert_adjmat"])
@@ -221,10 +226,18 @@ def main():
 
 			avg_loss += loss.item()
 		train_loss_list.append(avg_loss / len(train_dataloader))
+		model.eval() # Equivalent to model.train(False)
 
-		model.eval()
 		with torch.no_grad():
-			#validation set
+			# Ths only difference between valid and test sets is that the loss
+			# is only calculated for the valid set, then this loss is used as
+			# criterion to accept the new model or not.
+
+			# The predictions on the test set are always calculated and stored,
+			# but only the predictions for the 'best' model (lower validation loss)
+			# is printed and plotted in the end
+
+			# validation set
 			for i, data in enumerate(valid_dataloader):
 				data = {key:value.to(device) for key, value in data.items()}
 				position_num = torch.arange(256).repeat(data["smiles_bert_input"].size(0),1).to(device)
@@ -253,9 +266,10 @@ def main():
 				valid_rmse = sum(valid_rmse) / len(valid_rmse)
 				valid_score_list.append(valid_rmse[0])
 
-			#save the model
+			# save the model
+			# Only saved if it reduces the validation loss
 			if valid_avg_loss < min_valid_loss:
-				save_path = 'output/derived/Finetuned_model.pt'
+				save_path = f"output/derived/Finetuned_model_{epoch}.pt"
 				torch.save(model.state_dict(), save_path)
 				model.to(device)
 				min_valid_loss = valid_avg_loss
@@ -263,7 +277,7 @@ def main():
 			predicted_list = np.array([])
 			target_list = np.array([])
 
-			#Test set
+			# Test set
 			for i, data in enumerate(test_dataloader):
 				data = {key:value.to(device) for key, value in data.items()}
 				position_num = torch.arange(256).repeat(data["smiles_bert_input"].size(0),1).to(device)
@@ -315,11 +329,13 @@ def main():
 	output_csv['Valid_score'] = valid_score_list
 	output_csv.to_csv('output/derived/result.csv')
 
+	# roc curve or r2
+	# These next plots are saved only for the model with the best validation loss
 	best_step = np.argmin(valid_loss_list)
 	best_score = test_score_list[best_step]
 
-	# roc curve or r2
-
+	output_json['best_step']  = best_step
+	output_json['best_score'] = round(best_score,5)
 
 	output_json = params
 	if input_file['task'] == 'classification':
@@ -342,13 +358,15 @@ def main():
 		plt.figure(3)
 		t_true, t_pred = test_result_list[best_step][0], test_result_list[best_step][1]
 		plt.scatter(t_true, t_pred, s=10)
-		plt.plot([t_true.min(), t_true.max()], [t_true.min(), t_true.max()], color='red', label='R-squared Score = %0.2f' % r2_score(t_true, t_pred), linestyle='--')
+
+		# The line on the plot is *not* a regression line, it is a x=y line.
+		plt.plot([t_true.min(), t_true.max()], [t_true.min(), t_true.max()], 
+				 color='red', label='R-squared Score = %0.2f' % r2_score(t_true, t_pred), linestyle='--')
 		plt.xlabel('Actual')
 		plt.ylabel('Predicted')
 		plt.title('Scatter Plot')
 		plt.legend(loc='lower right')
 		plt.savefig('output/derived/test_score.png')
-	output_json['best_score'] = round(best_score,5)
 
 	with open('output/metadata/dm.json', 'w') as f:
 		json.dump(output_json, f)
