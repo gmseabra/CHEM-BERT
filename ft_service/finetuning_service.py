@@ -14,6 +14,8 @@ from torch.utils.data import Dataset, SubsetRandomSampler, DataLoader, Sequentia
 
 from rdkit import Chem
 from rdkit.Chem.rdmolops import GetAdjacencyMatrix
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, roc_curve, r2_score, auc
 from model import Smiles_BERT, BERT_base
 
@@ -159,14 +161,41 @@ def main():
 	# split the data into 3 parts (train/test/valid), where
 	# 'split_ratio'% is train, and the remaining is equally
 	# divided into test/valid
-	indices = list(range(len(dataset)))
-	np.random.shuffle(indices)
-	split1, split2 = int(np.floor(input_file['split_ratio'] * len(dataset))), int(np.floor(0.5 * (1 + input_file['split_ratio']) * len(dataset)))
-	train_idx, valid_idx, test_idx = indices[:split1], indices[split1:split2], indices[split2:]
+	#indices = list(range(len(dataset)))
+	#np.random.shuffle(indices)
+	#split1, split2 = int(np.floor(input_file['split_ratio'] * len(dataset))), int(np.floor(0.5 * (1 + input_file['split_ratio']) * len(dataset)))
+	#train_idx, valid_idx, test_idx = indices[:split1], indices[split1:split2], indices[split2:]
 
-	train_sampler = SubsetRandomSampler(train_idx)
-	valid_sampler = SubsetRandomSampler(valid_idx)
-	test_sampler  = SubsetRandomSampler(test_idx )
+	#train_sampler = SubsetRandomSampler(train_idx)
+	#valid_sampler = SubsetRandomSampler(valid_idx)
+	#test_sampler  = SubsetRandomSampler(test_idx )
+
+
+
+	# Not all binding energies are created equal...
+	# Before we can split, let's create split the energies in 3 groups
+	# ("binding", "intermediate","non-binding"), so the train/test splits
+	# can be stratified. (This should work with other properties as well)
+	labels = dataset.label
+	kbd = KBinsDiscretizer(3, encode="ordinal", strategy="kmeans")
+	kbd.fit(labels)
+	yt = kbd.transform(labels)
+	indices=list(range(len(dataset)))
+
+	# First, split in general train/test
+	X_train, X_testi, y_train, y_testi = train_test_split(indices, labels, 
+														  train_size=input_file['split_ratio'],
+														  shuffle=True, stratify=yt)
+
+	# Now, break the test set into test and validation
+	yt = np.take(yt, X_testi)
+	X_test, X_valid, y_test,  y_valid  = train_test_split(X_testi,y_testi,
+													      train_size=0.5,
+													      shuffle=True, stratify=yt)
+
+	train_sampler = SubsetRandomSampler(X_train)
+	valid_sampler = SubsetRandomSampler(X_valid)
+	test_sampler  = SubsetRandomSampler(X_test)
 
 	# dataloader(train, valid, test)
 	train_dataloader = DataLoader(dataset, batch_size=params['batch_size'], sampler=train_sampler, num_workers=4, pin_memory=True)
@@ -334,10 +363,10 @@ def main():
 	best_step = np.argmin(valid_loss_list)
 	best_score = test_score_list[best_step]
 
+	output_json = params
 	output_json['best_step']  = best_step
 	output_json['best_score'] = round(best_score,5)
 
-	output_json = params
 	if input_file['task'] == 'classification':
 		output_json['metric'] = 'AUC-ROC'
 		fpr, tpr, _ = roc_curve(test_result_list[best_step][0], test_result_list[best_step][1])
